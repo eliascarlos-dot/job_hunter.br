@@ -1,14 +1,4 @@
-
-# Linha 18: trocar
-# DE:   if not user or pw:
-# PARA: if not user or not pw:
-
-# Salvar: Ctrl+O, Enter, Ctrl+X
-
-# Commit
-git add modules/gmail_parser.py
-git commit -m "fix: corrige validação credenciais Gmail"
-git push origin main"""
+"""
 Módulo 1 — Gmail Parser
 Extrai vagas dos alertas do LinkedIn recebidos via Gmail
 ATUALIZADO: Extração melhorada de URLs, empresa e localização
@@ -32,7 +22,7 @@ def fetch_gmail_alerts():
     user = os.environ.get("GMAIL_USER")
     pw = os.environ.get("GMAIL_APP_PASSWORD")
 
-    if not user or  not pw:
+    if not user or not pw:
         print("   ❌ Erro: Credenciais do Gmail ausentes no Railway.")
         return
 
