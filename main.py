@@ -4,10 +4,18 @@ import json
 import argparse
 from datetime import datetime
 
+# Importa configurações do perfil
 try:
     from config.profile import FIT_THRESHOLD
 except ImportError:
     FIT_THRESHOLD = 65
+
+# Importar Google Sheets (se disponível)
+try:
+    from modules.sheets_backup import save_to_sheets
+    SHEETS_ENABLED = True
+except ImportError:
+    SHEETS_ENABLED = False
 
 def run_pipeline(gmail_only=False, gupy_only=False, dry_run=False):
     emails_lidos = 0
@@ -33,7 +41,11 @@ def run_pipeline(gmail_only=False, gupy_only=False, dry_run=False):
                 boost_target_companies
             )
             
-            gmail_jobs = fetch_gmail_alerts()
+            # Executa a busca real no Gmail
+            fetch_gmail_alerts()
+            
+            # Carrega os dados processados
+            gmail_jobs = _load_gmail_jobs()
             emails_lidos = len(gmail_jobs)
             
             if gmail_jobs:
@@ -45,11 +57,11 @@ def run_pipeline(gmail_only=False, gupy_only=False, dry_run=False):
                 print(f"   ✅ Vagas extraídas: {emails_lidos}")
                 print(f"   ✅ Vagas relevantes após filtros: {len(relevant)}")
             else:
-                print("   ⚠️ Nenhuma vaga nova encontrada no Gmail.")
+                print("   ⚠️ Nenhuma vaga nova (não lida) encontrada no Gmail.")
         except Exception as e:
             print(f"   ❌ Erro na Etapa 1: {e}")
 
-    # ── ETAPA 2: Gupy Scraper (desativado por padrão) ────────
+    # ── ETAPA 2: Gupy Scraper ────────────────────────────────
     if not gmail_only:
         print("\n🕷  ETAPA 2 — Gupy Scraper")
         try:
@@ -57,104 +69,65 @@ def run_pipeline(gmail_only=False, gupy_only=False, dry_run=False):
             gupy_result = run_gupy_search()
             all_relevant.extend(gupy_result["relevant_jobs"])
             all_discarded.extend(gupy_result["discarded_jobs"])
-            print(f"   ✅ Gupy: {len(gupy_result['relevant_jobs'])} vagas")
+            print(f"   ✅ Gupy: {len(gupy_result['relevant_jobs'])} vagas encontradas")
         except Exception as e:
             print(f"   ❌ Erro na Etapa 2: {e}")
 
-    # ── ETAPA 3: Deduplicação ────────────────────────────────
-    print(f"\n🔍 ETAPA 3 — Deduplicação")
-    from modules.deduplicator import filter_new_jobs, mark_as_analyzed, get_stats
-    
-    stats = get_stats()
-    if stats["total"] > 0:
-        print(f"   📊 Histórico: {stats['total']} vagas já analisadas")
-    
-    new_jobs, duplicates = filter_new_jobs(all_relevant)
-    
-    if duplicates:
-        print(f"   ⏭️  Puladas {len(duplicates)} vagas repetidas")
-    
-    all_relevant = new_jobs  # Só processa as novas
-    
-    print(f"\n🔀 ETAPA 4 — Consolidação Global")
+    # ── ETAPA 3: Consolidação ────────────────────────────────
+    print(f"\n🔀 ETAPA 3 — Consolidação Global")
     from modules.gmail_parser import deduplicate_jobs
     all_relevant = deduplicate_jobs(all_relevant)
     print(f"   ✅ Total para análise da IA: {len(all_relevant)} vagas")
 
     if not all_relevant:
-        print("\n😶 Nenhuma vaga nova para processar hoje.")
+        print("\n😶 Nenhuma vaga relevante para processar hoje.")
         _save_results(run_date, dry_run, [], [], [])
         return
 
-    # ── ETAPA 5: Scorer (IA) ──────────────────────────────────
-    print(f"\n🤖 ETAPA 5 — Scorer (Claude API)")
+    # ── ETAPA 4: Scorer (IA) ──────────────────────────────────
+    print(f"\n🤖 ETAPA 4 — Scorer (Claude API)")
     approved, rejected_score = [], []
     if dry_run:
-        print("   ⚠️  MODO TESTE (Dry Run): Simulando aprovações.")
+        print("   ⚠️  MODO TESTE (Dry Run): Aprovando vagas automaticamente.")
         approved = all_relevant[:3]
         rejected_score = all_relevant[3:]
         for j in approved:
-            j.update({"score_total": 80, "aprovado": True, "resumo_fit": "Simulação"})
+            j.update({"score_total": 80, "aprovado": True, "resumo_fit": "Simulação de teste"})
     else:
         try:
             from modules.scorer import score_jobs_batch
             approved, rejected_score = score_jobs_batch(all_relevant)
-            
-            # Salva no histórico APÓS scoring
-            mark_as_analyzed(all_relevant)
-            
         except Exception as e:
             print(f"   ❌ Erro no Scorer: {e}")
+
+    # ── ETAPA 5: Google Sheets Backup ────────────────────────
+    if SHEETS_ENABLED:
+        print(f"\n📊 ETAPA 5 — Backup Google Sheets")
+        try:
+            all_rejected = all_discarded + rejected_score
+            save_to_sheets(approved, all_rejected, run_date)
+        except Exception as e:
+            print(f"   ⚠️ Erro no Sheets: {e}")
+    else:
+        print(f"\n⚠️ Google Sheets não configurado (dados salvos localmente)")
 
     # ── ETAPA 6: Formatter e Notificação ──────────────────────
     print(f"\n📋 ETAPA 6 — Notificação")
     try:
         from modules.briefing_formatter import save_briefings, send_telegram
-        from modules.email_sender import send_email_briefing, format_email_html
-        
         all_rejected = all_discarded + rejected_score
         briefings = save_briefings(approved, all_rejected, run_date)
         
-        # Telegram
         token = os.environ.get("TELEGRAM_TOKEN")
         chat_id = os.environ.get("TELEGRAM_CHAT_ID")
         
         if briefings.get('telegram') and token and chat_id and not dry_run:
             send_telegram(token, chat_id, briefings['telegram'])
             print("   ✅ Alerta enviado para o Telegram!")
-        
-        # Email
-        if not dry_run:
-            email_html = format_email_html(
-                approved, 
-                {"analyzed": len(all_relevant), "approved": len(approved), "rejected": len(all_rejected)},
-                run_date
-            )
-            send_email_briefing(email_html)
-            
     except Exception as e:
         print(f"   ❌ Erro no envio: {e}")
 
     _save_results(run_date, dry_run, all_relevant, approved, all_discarded + rejected_score)
-    
-    # Gera e envia relatório completo
-    if approved and not dry_run:
-        try:
-            from generate_report import generate_consolidated_report
-            from modules.email_sender import send_email_briefing
-            
-            report_html = generate_consolidated_report()
-            
-            # Salva localmente
-            with open("output/relatorio_completo.html", "w", encoding="utf-8") as f:
-                f.write(report_html)
-            
-            # Envia por email
-            send_email_briefing(report_html)
-            print("   📧 Relatório completo enviado por email")
-        except Exception as e:
-            print(f"   ⚠️ Erro ao gerar relatório: {e}")
-    
     print("\n" + "=" * 55)
     print("   📊 DASHBOARD FINAL")
     print(f"   📩 Vagas brutas (Gmail): {emails_lidos}")
